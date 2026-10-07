@@ -25,7 +25,8 @@ export default {
     }
 
     if (path === "/api/track") {
-      ctx.waitUntil(recordView(request, env).catch(() => {}));
+      const source = url.searchParams.get("src") || "site";
+      ctx.waitUntil(recordVisit(request, env, source).catch(() => {}));
       return json({ ok: true }, cors);
     }
 
@@ -75,10 +76,47 @@ async function sha256(input) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
 }
 
-async function recordView(request, env) {
+function parseUA(ua) {
+  const s = ua || "";
+  let browser = "Unknown";
+  let os = "Unknown";
+  let device = "Desktop";
+
+  const edge = s.match(/Edg(?:e|A|iOS)?\/([\d.]+)/);
+  const opera = s.match(/OPR\/([\d.]+)/);
+  const chrome = s.match(/Chrome\/([\d.]+)/);
+  const firefox = s.match(/Firefox\/([\d.]+)/);
+  const safari = s.match(/Version\/([\d.]+).*Safari/);
+  const curl = s.match(/^curl\/([\d.]+)/i);
+
+  if (edge) browser = `Edge ${edge[1].split(".")[0]}`;
+  else if (opera) browser = `Opera ${opera[1].split(".")[0]}`;
+  else if (/github-camo/i.test(s)) browser = "GitHub Camo";
+  else if (curl) browser = `curl ${curl[1]}`;
+  else if (firefox) browser = `Firefox ${firefox[1].split(".")[0]}`;
+  else if (chrome && !/Chromium/.test(s)) browser = `Chrome ${chrome[1].split(".")[0]}`;
+  else if (safari) browser = `Safari ${safari[1].split(".")[0]}`;
+  else if (/WinHttp|Microsoft/i.test(s)) browser = "Windows";
+
+  if (/Windows NT 10/.test(s)) os = "Windows 10/11";
+  else if (/Windows NT/.test(s)) os = "Windows";
+  else if (/CrOS/.test(s)) os = "ChromeOS";
+  else if (/Android/.test(s)) os = "Android";
+  else if (/iPhone|iPad|iPod/.test(s)) os = "iOS";
+  else if (/Mac OS X|Macintosh/.test(s)) os = "macOS";
+  else if (/Linux/.test(s)) os = "Linux";
+
+  if (/iPad|Tablet/.test(s)) device = "Tablet";
+  else if (/Mobile|Android|iPhone/i.test(s)) device = "Mobile";
+
+  return { browser, os, device };
+}
+
+async function recordVisit(request, env, source) {
   const kv = env.PROFILE_VIEWS;
   if (!kv) return;
 
+  const url = new URL(request.url);
   const cf = request.cf || {};
   const country = (cf.country || "XX").toUpperCase();
   const now = new Date();
@@ -86,9 +124,10 @@ async function recordView(request, env) {
   const minute = Math.floor(Date.now() / (ONE_MINUTE * 1000));
   const ip =
     request.headers.get("cf-connecting-ip") ||
-    request.headers.get("x-forwarded-for") ||
+    (request.headers.get("x-forwarded-for") || "").split(",")[0].trim() ||
     "0.0.0.0";
   const ua = request.headers.get("user-agent") || "";
+  const { browser, os, device } = parseUA(ua);
 
   await Promise.all([
     bump(env, "stat:total"),
@@ -108,16 +147,48 @@ async function recordView(request, env) {
     ]);
   }
 
+  const visit = {
+    ts: now.toISOString(),
+    source,
+    path: source === "site" ? url.searchParams.get("path") || "/" : "profile-badge",
+    ref: source === "site" ? url.searchParams.get("ref") || "" : request.headers.get("referer") || "",
+    ip,
+    country,
+    city: cf.city || null,
+    region: cf.region || null,
+    org: cf.asOrganization || null,
+    asn: cf.asn || null,
+    tz: cf.timezone || null,
+    browser,
+    os,
+    device,
+  };
+
+  await pushVisit(env, visit);
+
   await Promise.all([
     kv.put("stat:last_seen", now.toISOString()),
     kv.put("stat:last_country", country),
   ]);
 }
 
+async function pushVisit(env, visit) {
+  const kv = env.PROFILE_VIEWS;
+  let list = [];
+  try {
+    list = JSON.parse((await kv.get("visit:recent")) || "[]");
+  } catch {
+    list = [];
+  }
+  list.unshift(visit);
+  if (list.length > 100) list = list.slice(0, 100);
+  await kv.put("visit:recent", JSON.stringify(list), { expirationTtl: ONE_DAY * 30 });
+}
+
 async function getStats(env) {
   const kv = env.PROFILE_VIEWS;
   if (!kv) {
-    return { total: 0, uniques: 0, live: 0, countries: [], days: [], generatedAt: new Date().toISOString() };
+    return { total: 0, uniques: 0, live: 0, countries: [], days: [], recent: [], generatedAt: new Date().toISOString() };
   }
 
   const total = parseInt((await kv.get("stat:total")) || "0", 10);
@@ -154,6 +225,13 @@ async function getStats(env) {
     live += parseInt((await kv.get(`live:${minute - i}`)) || "0", 10);
   }
 
+  let recent = [];
+  try {
+    recent = JSON.parse((await kv.get("visit:recent")) || "[]").slice(0, 60);
+  } catch {
+    recent = [];
+  }
+
   return {
     total,
     uniques,
@@ -162,12 +240,13 @@ async function getStats(env) {
     lastCountry: await kv.get("stat:last_country"),
     countries,
     days,
+    recent,
     generatedAt: new Date().toISOString(),
   };
 }
 
 async function handleBadge(request, env, ctx) {
-  ctx.waitUntil(recordView(request, env).catch(() => {}));
+  ctx.waitUntil(recordVisit(request, env, "badge").catch(() => {}));
 
   let total = 0;
   if (env.PROFILE_VIEWS) {
@@ -294,7 +373,7 @@ function dashboardHtml(username, key) {
   :root{--bg:#0d1117;--card:#161b22;--border:#30363d;--muted:#8b949e;--text:#e6edf3;--accent:#2ea44f;--accent2:#58a6ff}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;padding:32px 20px}
-  .wrap{max-width:900px;margin:0 auto}
+  .wrap{max-width:1000px;margin:0 auto}
   header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px;flex-wrap:wrap}
   h1{font-size:18px;margin:0;font-weight:600}
   .sub{color:var(--muted);font-size:13px;margin-top:4px}
@@ -307,7 +386,7 @@ function dashboardHtml(username, key) {
   .card .label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em}
   .card .value{font-size:30px;font-weight:700;margin-top:8px}
   .card.accent .value{color:var(--accent)}
-  section{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;margin-bottom:24px}
+  section{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;margin-bottom:24px;overflow-x:auto}
   section h2{font-size:14px;margin:0 0 16px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
   .row{display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid var(--border)}
   .row:last-child{border-bottom:0}
@@ -319,6 +398,14 @@ function dashboardHtml(username, key) {
   .daycol{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:6px;height:100%}
   .daybar{width:100%;background:linear-gradient(180deg,var(--accent2),var(--accent));border-radius:4px;min-height:3px}
   .daylabel{font-size:10px;color:var(--muted);white-space:nowrap}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;color:var(--muted);font-weight:600;text-transform:uppercase;font-size:10px;letter-spacing:.06em;padding:6px 10px;border-bottom:1px solid var(--border);white-space:nowrap}
+  td{padding:8px 10px;border-bottom:1px solid var(--border);white-space:nowrap}
+  tr:last-child td{border-bottom:0}
+  .tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600}
+  .tag.site{background:rgba(46,164,79,.15);color:#3fb950}
+  .tag.badge{background:rgba(88,166,255,.15);color:#58a6ff}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
   footer{color:var(--muted);font-size:12px;text-align:center}
   .err{color:#f85149;font-size:13px;margin-top:12px}
 </style></head>
@@ -339,6 +426,11 @@ function dashboardHtml(username, key) {
   </div>
 
   <section>
+    <h2>Recent activity</h2>
+    <div id="recent"><div class="err">No visits yet.</div></div>
+  </section>
+
+  <section>
     <h2>Top countries</h2>
     <div id="countries"><div class="err">No data yet.</div></div>
   </section>
@@ -355,6 +447,35 @@ function dashboardHtml(username, key) {
 <script>
   const KEY = ${JSON.stringify(key)};
   const fmt = (n) => (n || 0).toLocaleString("en-GB");
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  function timeAgo(iso) {
+    const sec = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+    if (sec < 60) return sec + "s ago";
+    if (sec < 3600) return Math.floor(sec / 60) + "m ago";
+    if (sec < 86400) return Math.floor(sec / 3600) + "h ago";
+    return Math.floor(sec / 86400) + "d ago";
+  }
+
+  function renderRecent(list) {
+    if (!list || !list.length) return '<div class="err">No visits yet.</div>';
+    return '<table><thead><tr><th>When</th><th>Source</th><th>Browser</th><th>OS</th><th>Device</th><th>Location</th><th>IP</th><th>Network</th></tr></thead><tbody>'
+      + list.map(function (v) {
+          const loc = [v.city, v.region, v.country].filter(Boolean).join(", ");
+          const tag = v.source === "site" ? '<span class="tag site">site</span>' : '<span class="tag badge">badge</span>';
+          return "<tr>"
+            + '<td title="' + esc(new Date(v.ts).toLocaleString("en-GB")) + '">' + timeAgo(v.ts) + "</td>"
+            + "<td>" + tag + "</td>"
+            + "<td>" + esc(v.browser) + "</td>"
+            + "<td>" + esc(v.os) + "</td>"
+            + "<td>" + esc(v.device) + "</td>"
+            + "<td>" + esc(loc) + "</td>"
+            + '<td class="mono">' + esc(v.ip) + "</td>"
+            + "<td>" + esc(v.org || v.asn || "") + "</td>"
+            + "</tr>";
+        }).join("")
+      + "</tbody></table>";
+  }
 
   async function refresh() {
     try {
@@ -368,6 +489,8 @@ function dashboardHtml(username, key) {
       document.getElementById("ccount").textContent = fmt(d.countries.length);
       document.getElementById("stamp").textContent = "Updated " + new Date(d.generatedAt).toLocaleTimeString("en-GB");
       document.getElementById("err").textContent = "";
+
+      document.getElementById("recent").innerHTML = renderRecent(d.recent);
 
       const max = d.countries.length ? d.countries[0].views : 1;
       document.getElementById("countries").innerHTML = d.countries.length
