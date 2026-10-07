@@ -1,5 +1,138 @@
-const ONE_DAY = 86400;
 const ONE_MINUTE = 60;
+
+const EMPTY = () => ({
+  total: 0,
+  uniques: 0,
+  countries: {},
+  days: {},
+  uniqDays: {},
+  live: {},
+  recent: [],
+  seen: {},
+  lastSeen: null,
+  lastCountry: null,
+});
+
+export class Stats {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    this.data = null;
+    this.loading = null;
+  }
+
+  async ready() {
+    if (this.data) return;
+    if (!this.loading) {
+      this.loading = this.state.storage.get("data").then((stored) => {
+        this.data = stored || EMPTY();
+      });
+    }
+    await this.loading;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+
+    if (request.method === "POST" && url.pathname === "/visit") {
+      const visit = await request.json();
+      await this.ready();
+      await this.record(visit);
+      return Response.json({ ok: true, total: this.data.total });
+    }
+
+    if (url.pathname === "/stats") {
+      await this.ready();
+      return Response.json(this.snapshot());
+    }
+
+    return new Response("not found", { status: 404 });
+  }
+
+  async record(visit) {
+    const d = this.data;
+    const day = visit.ts.slice(0, 10);
+    const minute = Math.floor(Date.now() / (ONE_MINUTE * 1000));
+
+    d.total += 1;
+    d.countries[visit.country] = (d.countries[visit.country] || 0) + 1;
+    d.days[day] = (d.days[day] || 0) + 1;
+    d.live[minute] = (d.live[minute] || 0) + 1;
+    d.lastSeen = visit.ts;
+    d.lastCountry = visit.country;
+
+    const hash = visit.visitorHash;
+    if (hash) {
+      const prevDay = d.seen[hash];
+      if (prevDay !== day) {
+        d.uniqDays[day] = (d.uniqDays[day] || 0) + 1;
+        if (!prevDay) d.uniques += 1;
+        d.seen[hash] = day;
+      }
+    }
+
+    d.recent.unshift(visit);
+    if (d.recent.length > 100) d.recent.length = 100;
+
+    this.prune();
+    await this.state.storage.put("data", d);
+  }
+
+  prune() {
+    const d = this.data;
+    const minute = Math.floor(Date.now() / (ONE_MINUTE * 1000));
+    for (const key of Object.keys(d.live)) {
+      if (Number(key) < minute - 30) delete d.live[key];
+    }
+    const cutoff = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+    for (const key of Object.keys(d.days)) {
+      if (key < cutoff) {
+        delete d.days[key];
+        delete d.uniqDays[key];
+      }
+    }
+    const seenKeys = Object.keys(d.seen);
+    if (seenKeys.length > 20000) {
+      const keep = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+      for (const key of seenKeys) {
+        if (d.seen[key] < keep) delete d.seen[key];
+      }
+    }
+  }
+
+  snapshot() {
+    const d = this.data;
+    const minute = Math.floor(Date.now() / (ONE_MINUTE * 1000));
+
+    let live = 0;
+    for (let i = 0; i < 5; i++) live += d.live[minute - i] || 0;
+
+    const countries = Object.entries(d.countries)
+      .map(([code, views]) => ({ code, name: countryName(code), flag: flagEmoji(code), views }))
+      .filter((c) => c.views > 0)
+      .sort((a, b) => b.views - a.views);
+
+    const days = [];
+    for (let i = 13; i >= 0; i--) {
+      const date = new Date();
+      date.setUTCDate(date.getUTCDate() - i);
+      const key = date.toISOString().slice(0, 10);
+      days.push({ day: key, views: d.days[key] || 0, uniques: d.uniqDays[key] || 0 });
+    }
+
+    return {
+      total: d.total,
+      uniques: d.uniques,
+      live,
+      lastSeen: d.lastSeen,
+      lastCountry: d.lastCountry,
+      countries,
+      days,
+      recent: d.recent.slice(0, 60),
+      generatedAt: new Date().toISOString(),
+    };
+  }
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -21,12 +154,17 @@ export default {
     }
 
     if (path === "/badge" || path === "/badge.svg") {
-      return handleBadge(request, env, ctx);
+      return handleBadge(request, env);
     }
 
     if (path === "/api/track") {
       const source = url.searchParams.get("src") || "site";
-      ctx.waitUntil(recordVisit(request, env, source).catch(() => {}));
+      ctx.waitUntil(
+        (async () => {
+          const visit = await buildVisit(request, env, source);
+          await ingest(env, visit);
+        })().catch(() => {})
+      );
       return json({ ok: true }, cors);
     }
 
@@ -34,7 +172,7 @@ export default {
       if (!isAuthorized(url, env)) {
         return json({ error: "unauthorized" }, cors, 401);
       }
-      const stats = await getStats(env);
+      const stats = await readStats(env);
       return json(stats, cors);
     }
 
@@ -45,6 +183,24 @@ export default {
     return new Response("Not found", { status: 404 });
   },
 };
+
+function stub(env) {
+  return env.STATS.get(env.STATS.idFromName("global"));
+}
+
+async function ingest(env, visit) {
+  const res = await stub(env).fetch("https://do/visit", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(visit),
+  });
+  return res.json();
+}
+
+async function readStats(env) {
+  const res = await stub(env).fetch("https://do/stats");
+  return res.json();
+}
 
 function json(body, headers = {}, status = 200) {
   return new Response(JSON.stringify(body, null, 2), {
@@ -60,14 +216,6 @@ function json(body, headers = {}, status = 200) {
 function isAuthorized(url, env) {
   const key = url.searchParams.get("key");
   return !!env.DASHBOARD_KEY && key === env.DASHBOARD_KEY;
-}
-
-async function bump(env, key, ttlSeconds) {
-  const raw = await env.PROFILE_VIEWS.get(key);
-  const next = (parseInt(raw || "0", 10) || 0) + 1;
-  const opts = ttlSeconds ? { expirationTtl: ttlSeconds } : {};
-  await env.PROFILE_VIEWS.put(key, String(next), opts);
-  return next;
 }
 
 async function sha256(input) {
@@ -112,43 +260,20 @@ function parseUA(ua) {
   return { browser, os, device };
 }
 
-async function recordVisit(request, env, source) {
-  const kv = env.PROFILE_VIEWS;
-  if (!kv) return;
-
+async function buildVisit(request, env, source) {
   const url = new URL(request.url);
   const cf = request.cf || {};
   const country = (cf.country || "XX").toUpperCase();
-  const now = new Date();
-  const day = now.toISOString().slice(0, 10);
-  const minute = Math.floor(Date.now() / (ONE_MINUTE * 1000));
   const ip =
     request.headers.get("cf-connecting-ip") ||
     (request.headers.get("x-forwarded-for") || "").split(",")[0].trim() ||
     "0.0.0.0";
   const ua = request.headers.get("user-agent") || "";
   const { browser, os, device } = parseUA(ua);
-
-  await Promise.all([
-    bump(env, "stat:total"),
-    bump(env, `stat:country:${country}`),
-    bump(env, `stat:day:${day}`, ONE_DAY * 60),
-    bump(env, `live:${minute}`, ONE_MINUTE * 15),
-  ]);
-
   const visitorHash = await sha256(`${ip}|${ua}`);
-  const uniqKey = `uniq:${day}:${visitorHash}`;
-  const seen = await kv.get(uniqKey);
-  if (!seen) {
-    await kv.put(uniqKey, "1", { expirationTtl: ONE_DAY * 2 });
-    await Promise.all([
-      bump(env, `stat:uniqday:${day}`, ONE_DAY * 60),
-      bump(env, "stat:uniqtotal"),
-    ]);
-  }
 
-  const visit = {
-    ts: now.toISOString(),
+  return {
+    ts: new Date().toISOString(),
     source,
     path: source === "site" ? url.searchParams.get("path") || "/" : "profile-badge",
     ref: source === "site" ? url.searchParams.get("ref") || "" : request.headers.get("referer") || "",
@@ -162,95 +287,18 @@ async function recordVisit(request, env, source) {
     browser,
     os,
     device,
-  };
-
-  await pushVisit(env, visit);
-
-  await Promise.all([
-    kv.put("stat:last_seen", now.toISOString()),
-    kv.put("stat:last_country", country),
-  ]);
-}
-
-async function pushVisit(env, visit) {
-  const kv = env.PROFILE_VIEWS;
-  let list = [];
-  try {
-    list = JSON.parse((await kv.get("visit:recent")) || "[]");
-  } catch {
-    list = [];
-  }
-  list.unshift(visit);
-  if (list.length > 100) list = list.slice(0, 100);
-  await kv.put("visit:recent", JSON.stringify(list), { expirationTtl: ONE_DAY * 30 });
-}
-
-async function getStats(env) {
-  const kv = env.PROFILE_VIEWS;
-  if (!kv) {
-    return { total: 0, uniques: 0, live: 0, countries: [], days: [], recent: [], generatedAt: new Date().toISOString() };
-  }
-
-  const total = parseInt((await kv.get("stat:total")) || "0", 10);
-  const uniques = parseInt((await kv.get("stat:uniqtotal")) || "0", 10);
-
-  const countries = [];
-  let cursor = undefined;
-  do {
-    const list = await kv.list({ prefix: "stat:country:", cursor });
-    for (const entry of list.keys) {
-      const code = entry.name.replace("stat:country:", "");
-      const views = parseInt((await kv.get(entry.name)) || "0", 10);
-      if (views > 0) countries.push({ code, name: countryName(code), flag: flagEmoji(code), views });
-    }
-    cursor = list.list_complete ? undefined : list.cursor;
-  } while (cursor);
-  countries.sort((a, b) => b.views - a.views);
-
-  const days = [];
-  for (let i = 13; i >= 0; i--) {
-    const d = new Date();
-    d.setUTCDate(d.getUTCDate() - i);
-    const key = d.toISOString().slice(0, 10);
-    days.push({
-      day: key,
-      views: parseInt((await kv.get(`stat:day:${key}`)) || "0", 10),
-      uniques: parseInt((await kv.get(`stat:uniqday:${key}`)) || "0", 10),
-    });
-  }
-
-  const minute = Math.floor(Date.now() / (ONE_MINUTE * 1000));
-  let live = 0;
-  for (let i = 0; i < 5; i++) {
-    live += parseInt((await kv.get(`live:${minute - i}`)) || "0", 10);
-  }
-
-  let recent = [];
-  try {
-    recent = JSON.parse((await kv.get("visit:recent")) || "[]").slice(0, 60);
-  } catch {
-    recent = [];
-  }
-
-  return {
-    total,
-    uniques,
-    live,
-    lastSeen: await kv.get("stat:last_seen"),
-    lastCountry: await kv.get("stat:last_country"),
-    countries,
-    days,
-    recent,
-    generatedAt: new Date().toISOString(),
+    visitorHash,
   };
 }
 
-async function handleBadge(request, env, ctx) {
-  ctx.waitUntil(recordVisit(request, env, "badge").catch(() => {}));
-
+async function handleBadge(request, env) {
   let total = 0;
-  if (env.PROFILE_VIEWS) {
-    total = parseInt((await env.PROFILE_VIEWS.get("stat:total")) || "0", 10);
+  try {
+    const visit = await buildVisit(request, env, "badge");
+    const result = await ingest(env, visit);
+    total = result.total || 0;
+  } catch {
+    total = 0;
   }
 
   const svg = badgeSvg("profile views", formatNumber(total));
@@ -440,7 +488,7 @@ function dashboardHtml(username, key) {
     <div class="days" id="days"></div>
   </section>
 
-  <footer>Auto-refreshes every 15s · private to you · bookmark this URL</footer>
+  <footer>Live, updates every 4s · private to you · bookmark this URL</footer>
   <div class="err" id="err"></div>
 </div>
 
@@ -516,7 +564,7 @@ function dashboardHtml(username, key) {
   }
 
   refresh();
-  setInterval(refresh, 15000);
+  setInterval(refresh, 4000);
 </script>
 </body></html>`;
 }

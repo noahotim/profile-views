@@ -2,9 +2,13 @@ name = "profile-views"
 main = "src/index.js"
 compatibility_date = "2026-10-01"
 
-[[kv_namespaces]]
-binding = "PROFILE_VIEWS"
-id = "cd0d0f0111b14b1db6088685e63069c3"
+[[durable_objects.bindings]]
+name = "STATS"
+class_name = "Stats"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Stats"]
 
 [vars]
 GITHUB_USERNAME = "noahotim"
