@@ -1,0 +1,399 @@
+const ONE_DAY = 86400;
+const ONE_MINUTE = 60;
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const path = url.pathname.replace(/\/+$/, "") || "/";
+
+    const cors = {
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "GET, POST, OPTIONS",
+      "access-control-allow-headers": "content-type",
+    };
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: cors });
+    }
+
+    if (path === "/") {
+      return json({ ok: true, service: "profile-views", badge: "/badge", dashboard: "/dashboard" }, cors);
+    }
+
+    if (path === "/badge" || path === "/badge.svg") {
+      return handleBadge(request, env, ctx);
+    }
+
+    if (path === "/api/track") {
+      ctx.waitUntil(recordView(request, env).catch(() => {}));
+      return json({ ok: true }, cors);
+    }
+
+    if (path === "/api/stats") {
+      if (!isAuthorized(url, env)) {
+        return json({ error: "unauthorized" }, cors, 401);
+      }
+      const stats = await getStats(env);
+      return json(stats, cors);
+    }
+
+    if (path === "/dashboard") {
+      return handleDashboard(request, env, url);
+    }
+
+    return new Response("Not found", { status: 404 });
+  },
+};
+
+function json(body, headers = {}, status = 200) {
+  return new Response(JSON.stringify(body, null, 2), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      ...headers,
+    },
+  });
+}
+
+function isAuthorized(url, env) {
+  const key = url.searchParams.get("key");
+  return !!env.DASHBOARD_KEY && key === env.DASHBOARD_KEY;
+}
+
+async function bump(env, key, ttlSeconds) {
+  const raw = await env.PROFILE_VIEWS.get(key);
+  const next = (parseInt(raw || "0", 10) || 0) + 1;
+  const opts = ttlSeconds ? { expirationTtl: ttlSeconds } : {};
+  await env.PROFILE_VIEWS.put(key, String(next), opts);
+  return next;
+}
+
+async function sha256(input) {
+  const data = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
+}
+
+async function recordView(request, env) {
+  const kv = env.PROFILE_VIEWS;
+  if (!kv) return;
+
+  const cf = request.cf || {};
+  const country = (cf.country || "XX").toUpperCase();
+  const now = new Date();
+  const day = now.toISOString().slice(0, 10);
+  const minute = Math.floor(Date.now() / (ONE_MINUTE * 1000));
+  const ip =
+    request.headers.get("cf-connecting-ip") ||
+    request.headers.get("x-forwarded-for") ||
+    "0.0.0.0";
+  const ua = request.headers.get("user-agent") || "";
+
+  await Promise.all([
+    bump(env, "stat:total"),
+    bump(env, `stat:country:${country}`),
+    bump(env, `stat:day:${day}`, ONE_DAY * 60),
+    bump(env, `live:${minute}`, ONE_MINUTE * 15),
+  ]);
+
+  const visitorHash = await sha256(`${ip}|${ua}`);
+  const uniqKey = `uniq:${day}:${visitorHash}`;
+  const seen = await kv.get(uniqKey);
+  if (!seen) {
+    await kv.put(uniqKey, "1", { expirationTtl: ONE_DAY * 2 });
+    await Promise.all([
+      bump(env, `stat:uniqday:${day}`, ONE_DAY * 60),
+      bump(env, "stat:uniqtotal"),
+    ]);
+  }
+
+  await Promise.all([
+    kv.put("stat:last_seen", now.toISOString()),
+    kv.put("stat:last_country", country),
+  ]);
+}
+
+async function getStats(env) {
+  const kv = env.PROFILE_VIEWS;
+  if (!kv) {
+    return { total: 0, uniques: 0, live: 0, countries: [], days: [], generatedAt: new Date().toISOString() };
+  }
+
+  const total = parseInt((await kv.get("stat:total")) || "0", 10);
+  const uniques = parseInt((await kv.get("stat:uniqtotal")) || "0", 10);
+
+  const countries = [];
+  let cursor = undefined;
+  do {
+    const list = await kv.list({ prefix: "stat:country:", cursor });
+    for (const entry of list.keys) {
+      const code = entry.name.replace("stat:country:", "");
+      const views = parseInt((await kv.get(entry.name)) || "0", 10);
+      if (views > 0) countries.push({ code, name: countryName(code), flag: flagEmoji(code), views });
+    }
+    cursor = list.list_complete ? undefined : list.cursor;
+  } while (cursor);
+  countries.sort((a, b) => b.views - a.views);
+
+  const days = [];
+  for (let i = 13; i >= 0; i--) {
+    const d = new Date();
+    d.setUTCDate(d.getUTCDate() - i);
+    const key = d.toISOString().slice(0, 10);
+    days.push({
+      day: key,
+      views: parseInt((await kv.get(`stat:day:${key}`)) || "0", 10),
+      uniques: parseInt((await kv.get(`stat:uniqday:${key}`)) || "0", 10),
+    });
+  }
+
+  const minute = Math.floor(Date.now() / (ONE_MINUTE * 1000));
+  let live = 0;
+  for (let i = 0; i < 5; i++) {
+    live += parseInt((await kv.get(`live:${minute - i}`)) || "0", 10);
+  }
+
+  return {
+    total,
+    uniques,
+    live,
+    lastSeen: await kv.get("stat:last_seen"),
+    lastCountry: await kv.get("stat:last_country"),
+    countries,
+    days,
+    generatedAt: new Date().toISOString(),
+  };
+}
+
+async function handleBadge(request, env, ctx) {
+  ctx.waitUntil(recordView(request, env).catch(() => {}));
+
+  let total = 0;
+  if (env.PROFILE_VIEWS) {
+    total = parseInt((await env.PROFILE_VIEWS.get("stat:total")) || "0", 10);
+  }
+
+  const svg = badgeSvg("profile views", formatNumber(total));
+  return new Response(svg, {
+    headers: {
+      "content-type": "image/svg+xml; charset=utf-8",
+      "cache-control": "no-cache, no-store, max-age=0, must-revalidate",
+    },
+  });
+}
+
+async function handleDashboard(request, env, url) {
+  if (!env.DASHBOARD_KEY) {
+    return new Response(lockPage("Dashboard key not configured", "Run: npx wrangler secret put DASHBOARD_KEY"), {
+      status: 500,
+      headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+    });
+  }
+  if (!isAuthorized(url, env)) {
+    return new Response(
+      lockPage("Private dashboard", "Add ?key=YOUR_SECRET to the URL. The key is the DASHBOARD_KEY secret you set."),
+      { status: 401, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } }
+    );
+  }
+
+  const key = url.searchParams.get("key");
+  return new Response(dashboardHtml(env.GITHUB_USERNAME || "profile", key), {
+    headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+  });
+}
+
+function badgeSvg(label, value) {
+  const charWidth = 6.6;
+  const pad = 10;
+  const lw = Math.round(label.length * charWidth + pad * 2);
+  const vw = Math.round(value.length * charWidth + pad * 2);
+  const w = lw + vw;
+  const h = 20;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" role="img" aria-label="${esc(label)}: ${esc(value)}">
+  <title>${esc(label)}: ${esc(value)}</title>
+  <linearGradient id="s" x2="0" y2="100%">
+    <stop offset="0" stop-color="#bbb" stop-opacity=".1"/>
+    <stop offset="1" stop-opacity=".1"/>
+  </linearGradient>
+  <clipPath id="r"><rect width="${w}" height="${h}" rx="3" fill="#fff"/></clipPath>
+  <g clip-path="url(#r)">
+    <rect width="${lw}" height="${h}" fill="#555"/>
+    <rect x="${lw}" width="${vw}" height="${h}" fill="#2ea44f"/>
+    <rect width="${w}" height="${h}" fill="url(#s)"/>
+  </g>
+  <g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" text-rendering="geometricPrecision" font-size="11">
+    <text x="${lw / 2}" y="15" fill="#010101" fill-opacity=".3">${esc(label)}</text>
+    <text x="${lw / 2}" y="14">${esc(label)}</text>
+    <text x="${lw + vw / 2}" y="15" fill="#010101" fill-opacity=".3">${esc(value)}</text>
+    <text x="${lw + vw / 2}" y="14">${esc(value)}</text>
+  </g>
+</svg>`;
+}
+
+function formatNumber(n) {
+  return (n || 0).toLocaleString("en-GB");
+}
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function flagEmoji(code) {
+  if (!/^[A-Z]{2}$/.test(code)) return "🏳️";
+  return String.fromCodePoint(...[...code].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65));
+}
+
+const COUNTRY_NAMES = {
+  US: "United States", GB: "United Kingdom", UG: "Uganda", KE: "Kenya", TZ: "Tanzania",
+  NG: "Nigeria", ZA: "South Africa", GH: "Ghana", RW: "Rwanda", ET: "Ethiopia",
+  EG: "Egypt", MA: "Morocco", DZ: "Algeria", TN: "Tunisia", SN: "Senegal",
+  CM: "Cameroon", CI: "Côte d'Ivoire", ZM: "Zambia", ZW: "Zimbabwe", MW: "Malawi",
+  CA: "Canada", AU: "Australia", NZ: "New Zealand", IE: "Ireland", IN: "India",
+  PK: "Pakistan", BD: "Bangladesh", LK: "Sri Lanka", NP: "Nepal", CN: "China",
+  JP: "Japan", KR: "South Korea", SG: "Singapore", MY: "Malaysia", ID: "Indonesia",
+  PH: "Philippines", TH: "Thailand", VN: "Vietnam", AE: "United Arab Emirates",
+  SA: "Saudi Arabia", QA: "Qatar", KW: "Kuwait", TR: "Türkiye", IL: "Israel",
+  DE: "Germany", FR: "France", ES: "Spain", IT: "Italy", PT: "Portugal",
+  NL: "Netherlands", BE: "Belgium", CH: "Switzerland", AT: "Austria", SE: "Sweden",
+  NO: "Norway", DK: "Denmark", FI: "Finland", PL: "Poland", CZ: "Czechia",
+  RO: "Romania", GR: "Greece", HU: "Hungary", UA: "Ukraine", RU: "Russia",
+  BR: "Brazil", MX: "Mexico", AR: "Argentina", CL: "Chile", CO: "Colombia",
+  PE: "Peru", VE: "Venezuela", EC: "Ecuador", UY: "Uruguay", CR: "Costa Rica",
+  XX: "Unknown",
+};
+
+function countryName(code) {
+  return COUNTRY_NAMES[code] || code;
+}
+
+function lockPage(title, message) {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta name="robots" content="noindex,nofollow"/>
+<title>${esc(title)}</title>
+<style>
+  body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0d1117;color:#e6edf3;
+       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .box{max-width:420px;text-align:center;padding:40px}
+  h1{font-size:20px;margin:0 0 10px}
+  p{color:#8b949e;font-size:14px;line-height:1.5;margin:0}
+</style></head><body><div class="box"><h1>${esc(title)}</h1><p>${esc(message)}</p></div></body></html>`;
+}
+
+function dashboardHtml(username, key) {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta name="robots" content="noindex,nofollow"/>
+<title>${esc(username)} · profile views</title>
+<style>
+  :root{--bg:#0d1117;--card:#161b22;--border:#30363d;--muted:#8b949e;--text:#e6edf3;--accent:#2ea44f;--accent2:#58a6ff}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;padding:32px 20px}
+  .wrap{max-width:900px;margin:0 auto}
+  header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px;flex-wrap:wrap}
+  h1{font-size:18px;margin:0;font-weight:600}
+  .sub{color:var(--muted);font-size:13px;margin-top:4px}
+  .live{display:inline-flex;align-items:center;gap:8px;background:rgba(46,164,79,.12);color:var(--accent);
+        padding:6px 12px;border-radius:999px;font-size:13px;font-weight:600}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--accent);animation:pulse 1.6s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:24px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px}
+  .card .label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em}
+  .card .value{font-size:30px;font-weight:700;margin-top:8px}
+  .card.accent .value{color:var(--accent)}
+  section{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;margin-bottom:24px}
+  section h2{font-size:14px;margin:0 0 16px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+  .row{display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid var(--border)}
+  .row:last-child{border-bottom:0}
+  .flag{font-size:20px;width:26px;text-align:center}
+  .cname{flex:1;font-size:14px}
+  .cviews{color:var(--muted);font-variant-numeric:tabular-nums}
+  .bar{height:9px;border-radius:6px;background:linear-gradient(90deg,var(--accent),var(--accent2));min-width:3px}
+  .days{display:flex;align-items:flex-end;gap:6px;height:120px}
+  .daycol{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:6px;height:100%}
+  .daybar{width:100%;background:linear-gradient(180deg,var(--accent2),var(--accent));border-radius:4px;min-height:3px}
+  .daylabel{font-size:10px;color:var(--muted);white-space:nowrap}
+  footer{color:var(--muted);font-size:12px;text-align:center}
+  .err{color:#f85149;font-size:13px;margin-top:12px}
+</style></head>
+<body><div class="wrap">
+  <header>
+    <div>
+      <h1>${esc(username)} · profile views</h1>
+      <div class="sub" id="stamp">Loading…</div>
+    </div>
+    <div class="live"><span class="dot"></span><span id="live">0</span> viewing now</div>
+  </header>
+
+  <div class="grid">
+    <div class="card accent"><div class="label">Total views</div><div class="value" id="total">–</div></div>
+    <div class="card"><div class="label">Unique visitors</div><div class="value" id="uniques">–</div></div>
+    <div class="card"><div class="label">Live (5 min)</div><div class="value" id="live2">–</div></div>
+    <div class="card"><div class="label">Countries</div><div class="value" id="ccount">–</div></div>
+  </div>
+
+  <section>
+    <h2>Top countries</h2>
+    <div id="countries"><div class="err">No data yet.</div></div>
+  </section>
+
+  <section>
+    <h2>Last 14 days</h2>
+    <div class="days" id="days"></div>
+  </section>
+
+  <footer>Auto-refreshes every 15s · private to you · bookmark this URL</footer>
+  <div class="err" id="err"></div>
+</div>
+
+<script>
+  const KEY = ${JSON.stringify(key)};
+  const fmt = (n) => (n || 0).toLocaleString("en-GB");
+
+  async function refresh() {
+    try {
+      const res = await fetch("/api/stats?key=" + encodeURIComponent(KEY), { cache: "no-store" });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const d = await res.json();
+      document.getElementById("total").textContent = fmt(d.total);
+      document.getElementById("uniques").textContent = fmt(d.uniques);
+      document.getElementById("live").textContent = fmt(d.live);
+      document.getElementById("live2").textContent = fmt(d.live);
+      document.getElementById("ccount").textContent = fmt(d.countries.length);
+      document.getElementById("stamp").textContent = "Updated " + new Date(d.generatedAt).toLocaleTimeString("en-GB");
+      document.getElementById("err").textContent = "";
+
+      const max = d.countries.length ? d.countries[0].views : 1;
+      document.getElementById("countries").innerHTML = d.countries.length
+        ? d.countries.map(function (c) {
+            const pct = Math.max(3, Math.round((c.views / max) * 100));
+            return '<div class="row"><div class="flag">' + c.flag + '</div>'
+              + '<div class="cname">' + c.name + '</div>'
+              + '<div class="bar" style="width:' + (pct * 0.5) + 'px"></div>'
+              + '<div class="cviews">' + fmt(c.views) + '</div></div>';
+          }).join("")
+        : '<div class="err">No data yet.</div>';
+
+      const dayMax = Math.max.apply(null, d.days.map(function (x) { return x.views; }).concat([1]));
+      document.getElementById("days").innerHTML = d.days.map(function (x) {
+        const h = Math.max(3, Math.round((x.views / dayMax) * 100));
+        return '<div class="daycol" title="' + x.day + ': ' + fmt(x.views) + ' views, ' + fmt(x.uniques) + ' unique">'
+          + '<div class="daybar" style="height:' + h + '%"></div>'
+          + '<div class="daylabel">' + x.day.slice(5) + '</div></div>';
+      }).join("");
+    } catch (e) {
+      document.getElementById("err").textContent = "Could not load stats: " + e.message;
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 15000);
+</script>
+</body></html>`;
+}

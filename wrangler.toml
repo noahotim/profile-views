@@ -1,0 +1,15 @@
+name = "profile-views"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+[[kv_namespaces]]
+binding = "PROFILE_VIEWS"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+[vars]
+GITHUB_USERNAME = "noahotim"
+GITHUB_PROFILE_URL = "https://github.com/noahotim"
+
+# DASHBOARD_KEY is a secret, not a var. Set it with:
+#   npx wrangler secret put DASHBOARD_KEY
+# This key is what keeps the country breakdown private to you.

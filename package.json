@@ -1,0 +1,15 @@
+{
+  "name": "profile-views",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Live GitHub profile view counter with private country analytics, on Cloudflare Workers + KV.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^3.80.0"
+  }
+}

@@ -1,0 +1,2 @@
+# Copy to .dev.vars for local development (never commit the real file).
+DASHBOARD_KEY=change-me-to-a-long-random-string
