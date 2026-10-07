@@ -4,7 +4,7 @@ compatibility_date = "2026-10-01"
 
 [[kv_namespaces]]
 binding = "PROFILE_VIEWS"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "cd0d0f0111b14b1db6088685e63069c3"
 
 [vars]
 GITHUB_USERNAME = "noahotim"
