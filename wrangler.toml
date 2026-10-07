@@ -4,11 +4,15 @@ compatibility_date = "2026-10-01"
 
 [[durable_objects.bindings]]
 name = "STATS"
-class_name = "Stats"
+class_name = "ProfileStats"
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Stats"]
+
+[[migrations]]
+tag = "v2"
+renamed_classes = [{ from = "Stats", to = "ProfileStats" }]
 
 [vars]
 GITHUB_USERNAME = "noahotim"

@@ -13,7 +13,7 @@ const EMPTY = () => ({
   lastCountry: null,
 });
 
-export class Stats {
+export class ProfileStats {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -51,23 +51,27 @@ export class Stats {
 
   async record(visit) {
     const d = this.data;
-    const day = visit.ts.slice(0, 10);
-    const minute = Math.floor(Date.now() / (ONE_MINUTE * 1000));
+    const isTest = visit.source === "test";
 
-    d.total += 1;
-    d.countries[visit.country] = (d.countries[visit.country] || 0) + 1;
-    d.days[day] = (d.days[day] || 0) + 1;
-    d.live[minute] = (d.live[minute] || 0) + 1;
-    d.lastSeen = visit.ts;
-    d.lastCountry = visit.country;
+    if (!isTest) {
+      const day = visit.ts.slice(0, 10);
+      const minute = Math.floor(Date.now() / (ONE_MINUTE * 1000));
 
-    const hash = visit.visitorHash;
-    if (hash) {
-      const prevDay = d.seen[hash];
-      if (prevDay !== day) {
-        d.uniqDays[day] = (d.uniqDays[day] || 0) + 1;
-        if (!prevDay) d.uniques += 1;
-        d.seen[hash] = day;
+      d.total += 1;
+      d.countries[visit.country] = (d.countries[visit.country] || 0) + 1;
+      d.days[day] = (d.days[day] || 0) + 1;
+      d.live[minute] = (d.live[minute] || 0) + 1;
+      d.lastSeen = visit.ts;
+      d.lastCountry = visit.country;
+
+      const hash = visit.visitorHash;
+      if (hash) {
+        const prevDay = d.seen[hash];
+        if (prevDay !== day) {
+          d.uniqDays[day] = (d.uniqDays[day] || 0) + 1;
+          if (!prevDay) d.uniques += 1;
+          d.seen[hash] = day;
+        }
       }
     }
 
@@ -239,7 +243,7 @@ function parseUA(ua) {
 
   if (edge) browser = `Edge ${edge[1].split(".")[0]}`;
   else if (opera) browser = `Opera ${opera[1].split(".")[0]}`;
-  else if (/github-camo/i.test(s)) browser = "GitHub Camo";
+  else if (/camo/i.test(s)) browser = "GitHub Camo";
   else if (curl) browser = `curl ${curl[1]}`;
   else if (firefox) browser = `Firefox ${firefox[1].split(".")[0]}`;
   else if (chrome && !/Chromium/.test(s)) browser = `Chrome ${chrome[1].split(".")[0]}`;
@@ -268,15 +272,24 @@ async function buildVisit(request, env, source) {
     request.headers.get("cf-connecting-ip") ||
     (request.headers.get("x-forwarded-for") || "").split(",")[0].trim() ||
     "0.0.0.0";
-  const ua = request.headers.get("user-agent") || "";
-  const { browser, os, device } = parseUA(ua);
-  const visitorHash = await sha256(`${ip}|${ua}`);
+
+  const headerUa = request.headers.get("user-agent") || "";
+  const clientUa = url.searchParams.get("ua");
+  const rawUa = (clientUa && clientUa.length > 4 ? clientUa : headerUa) || "";
+  const parsed = parseUA(rawUa);
+
+  const hint = (name, max) => {
+    const value = url.searchParams.get(name);
+    return value ? value.slice(0, max) : null;
+  };
+
+  const visitorHash = await sha256(`${ip}|${rawUa}`);
 
   return {
     ts: new Date().toISOString(),
     source,
-    path: source === "site" ? url.searchParams.get("path") || "/" : "profile-badge",
-    ref: source === "site" ? url.searchParams.get("ref") || "" : request.headers.get("referer") || "",
+    path: source === "site" || source === "test" ? url.searchParams.get("path") || "/" : "profile-badge",
+    ref: source === "site" || source === "test" ? url.searchParams.get("ref") || "" : request.headers.get("referer") || "",
     ip,
     country,
     city: cf.city || null,
@@ -284,9 +297,10 @@ async function buildVisit(request, env, source) {
     org: cf.asOrganization || null,
     asn: cf.asn || null,
     tz: cf.timezone || null,
-    browser,
-    os,
-    device,
+    browser: hint("b", 60) || parsed.browser,
+    os: hint("o", 40) || parsed.os,
+    device: hint("d", 20) || parsed.device,
+    ua: rawUa.slice(0, 220),
     visitorHash,
   };
 }
@@ -453,6 +467,7 @@ function dashboardHtml(username, key) {
   .tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600}
   .tag.site{background:rgba(46,164,79,.15);color:#3fb950}
   .tag.badge{background:rgba(88,166,255,.15);color:#58a6ff}
+  .tag.test{background:rgba(210,153,34,.15);color:#d29922}
   .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
   footer{color:var(--muted);font-size:12px;text-align:center}
   .err{color:#f85149;font-size:13px;margin-top:12px}
@@ -510,11 +525,12 @@ function dashboardHtml(username, key) {
     return '<table><thead><tr><th>When</th><th>Source</th><th>Browser</th><th>OS</th><th>Device</th><th>Location</th><th>IP</th><th>Network</th></tr></thead><tbody>'
       + list.map(function (v) {
           const loc = [v.city, v.region, v.country].filter(Boolean).join(", ");
-          const tag = v.source === "site" ? '<span class="tag site">site</span>' : '<span class="tag badge">badge</span>';
+          const tagLabel = v.source === "site" ? "site" : v.source === "test" ? "test" : "badge";
+          const tag = '<span class="tag ' + tagLabel + '">' + tagLabel + '</span>';
           return "<tr>"
             + '<td title="' + esc(new Date(v.ts).toLocaleString("en-GB")) + '">' + timeAgo(v.ts) + "</td>"
             + "<td>" + tag + "</td>"
-            + "<td>" + esc(v.browser) + "</td>"
+            + '<td title="' + esc(v.ua || "") + '">' + esc(v.browser) + "</td>"
             + "<td>" + esc(v.os) + "</td>"
             + "<td>" + esc(v.device) + "</td>"
             + "<td>" + esc(loc) + "</td>"
